@@ -281,8 +281,10 @@ void* DbgAlloc(size_t bytes) {
     abort();
   }
 
-  if (total & (size_t)7) {
-    size_t total = (symbol + aligned + canary + 7) & (size_t)~7;
+  if (aligned == 0) {
+    printf("DbgAlloc: *** size integer overflow ***\n"
+           "=== aborted ===\n");
+    abort();
   }
 
   mem = (char*)ChunkAlloc(ctx->memory, total);
