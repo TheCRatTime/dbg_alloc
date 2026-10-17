@@ -258,7 +258,7 @@ void* DbgAlloc(size_t bytes) {
   AllocatorCtx* ctx = AllocatorCtxManager(0, NULL);
   
   size_t aligned = (bytes + 7) & (size_t)~7;
-  size_t canary = ((CANARY_SIZE << 2) + 7) & (size_t)~7;
+  size_t canary = ((CANARY_SIZE << 1) + 7) & (size_t)~7;
   size_t symbol = (sizeof(DbgSymbol) + 7) & (size_t)~7;
   
   size_t total = (symbol + aligned + canary + 7) & (size_t)~7;
