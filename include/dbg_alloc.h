@@ -20,10 +20,14 @@
 #include <stddef.h>
 
 #define CANARY_VALUE 0x43 /* Canary value */
-#define CANARY_SIZE  4    /* Canary size */
+#define CANARY_SIZE  8    /* Canary size */
 
-#define POSION_VALUE 0xCC /* Posion value */
-#define POSION_SIZE  8    /* Posion sizs */
+#define POISON_VALUE 0xCC /* Poison value */
+#define POISON_SIZE  8    /* Poison size */
+
+#define SH_MEM_VALID 0x00 /* Shadow memory valid. */
+#define SH_MEM_FREED 0xFD /* Shadow memory freed. */
+#define SH_MEM_BAD   0xBD /* Shadow memory bad. */
 
 #define DBG_MAGIC_1 0x01 /* Magic 1 */
 #define DBG_MAGIC_2 0x02 /* Magic 2 */
@@ -37,7 +41,7 @@ typedef struct DbgSymbol {
   dbg_uchar magic[4];   /* Magic characters */
 
   dbg_uchar freed;      /* Was block freed */
-  dbg_uchar padding[4]; /* Padding from 1 to 4 */
+  dbg_uchar padding[3]; /* Padding from 1 to 4 */
   
   size_t real_size;     /* Size of allocated data */
 } DbgSymbol;
@@ -55,7 +59,6 @@ typedef struct MemChunk {
   size_t left_bytes;  /* Left bytes of memory */
 } MemChunk;
 
-
 /* Allocator context. */
 typedef struct AllocatorCtx {
   void* self_ptr;             /* For free */
@@ -68,6 +71,9 @@ typedef struct AllocatorCtx {
   size_t pll_left;            /* PtrLinkedList left bytes */
   PtrLinkedList* cur_pll;     /* Current PtrLinkedList* node */
   dbg_uchar have_overflow;    /* Overflow check. */
+
+  char* sh_memory;            /* Shadow memory */
+  size_t sh_memory_size;      /* Shadow memory size */
   
   MemChunk* memory;           /* Memory for allocate */
 } AllocatorCtx;
@@ -98,6 +104,35 @@ void KillAllocator(void);
 
 /* Check all pointers in allocator. */
 void AllocatorFullCheck(void);
+
+/* Check pointer for use now. */
+void CheckForUse(void*);
+
+/* Get shadow memory offset for PTR */
+size_t GetShMemOffset(void*);
+
+/* Get count bytes of shadow memory. */
+size_t GetShMemCountBytes(size_t);
+
+/* Check all bytes in PTR with size SIZE */
+#define SH_MEM_CHECK(ptr, size) do { \
+  AllocatorCtx* ctx = AllocatorCtxManager(0, NULL); \
+  size_t offset = GetShMemOffset(ptr); \
+  size_t count = GetShMemCountBytes(size); \
+  size_t i = 0; \
+  \
+  if (ptr == NULL) { \
+    break; \
+  } \
+  \
+  for (; i < count; i++) { \
+    if (ctx->sh_memory[offset+i] != SH_MEM_VALID) { \
+      printf("SH_MEM_CHECK: *** pointer to a canary/debug info/freed block " \
+             "***\n=== aborted (core dumped) ===\n"); \
+      abort(); \
+    } \
+  } \
+} while(0)
 
 #endif /* DBG_ALLOC_DBG_ALLOC_H_ */
 
@@ -138,11 +173,20 @@ static PtrLinkedList* PLLAllocate(AllocatorCtx* ctx) {
   return pll;
 }
 
+static void FillShadowMem(char* sh_mem, size_t size) {
+  size_t i = 0;
+  
+  for (; i < size; i++) {
+    sh_mem[i] = SH_MEM_VALID;
+  }
+}
+
 int InitAllocator(size_t mem_size) {
   size_t aligned1 = 0;
   size_t aligned2 = 0;
   size_t aligned3 = 0;
   size_t aligned4 = 0;
+  size_t aligned5 = 0;
   size_t total = 0;
   size_t for_ptrs = 0;
   char* slice = NULL;
@@ -159,7 +203,8 @@ int InitAllocator(size_t mem_size) {
   aligned2 = (sizeof(MemChunk) + 7) & (size_t)~7;
   aligned3 = (mem_size + 7) & (size_t)~7;
   aligned4 = (for_ptrs + 7) & (size_t)~7;
-  total = aligned1 + aligned2 + aligned3 + aligned4;
+  aligned5 = ((aligned3 >> 3) + 7) & (size_t)~7;
+  total = aligned1 + aligned2 + aligned3 + aligned4 + aligned5;
 
   slice = (char*)malloc(total);
 
@@ -185,6 +230,11 @@ int InitAllocator(size_t mem_size) {
   allocator_ctx->cur_pll = allocator_ctx->head_of_pll;
   allocator_ctx->have_overflow = 0;
 
+  allocator_ctx->sh_memory = slice + aligned1 + aligned2 + aligned3 + aligned4;
+  allocator_ctx->sh_memory_size = aligned5;
+
+  FillShadowMem(allocator_ctx->sh_memory, aligned5);
+
   (void)AllocatorCtxManager(1, allocator_ctx);
   
   return 0;
@@ -206,22 +256,29 @@ static void* ChunkAlloc(MemChunk* chunk, size_t bytes) {
 
 void* DbgAlloc(size_t bytes) {
   AllocatorCtx* ctx = AllocatorCtxManager(0, NULL);
+  
   size_t aligned = (bytes + 7) & (size_t)~7;
   size_t canary = ((CANARY_SIZE << 2) + 7) & (size_t)~7;
   size_t symbol = (sizeof(DbgSymbol) + 7) & (size_t)~7;
+  
   size_t total = (symbol + aligned + canary + 7) & (size_t)~7;
+  
   char* mem = NULL;
-  int i = 0;
+  size_t i = 0;
   DbgSymbol* header = NULL;
   void* ret = NULL;
   char* tmp = NULL;
+  size_t sh_mem_offset = 0;
+  size_t sh_mem_count = 0;
   
   if (bytes == 0) {
     return NULL;
   }
 
   if (ctx == NULL) {
-    return NULL;
+    printf("DbgAlloc: *** context not initialized ***\n"
+           "=== aborted ===\n");
+    abort();
   }
 
   mem = (char*)ChunkAlloc(ctx->memory, total);
@@ -236,14 +293,35 @@ void* DbgAlloc(size_t bytes) {
   header->magic[3] = DBG_MAGIC_4;
   header->freed = 0;
   header->real_size = aligned;
+  
+  sh_mem_offset = (size_t)(((char*)header - ctx->memory->memory) >> 3);
+  sh_mem_count = ((sizeof(DbgSymbol) + 7) & (size_t)~7) >> 3;
+
+  for (; i < sh_mem_count; i++) {
+    ctx->sh_memory[sh_mem_offset+i] = SH_MEM_BAD;
+  }
 
   tmp = mem + symbol;
   
-  for (; i < CANARY_SIZE; i++) {
+  sh_mem_offset = (size_t)((tmp - ctx->memory->memory) >> 3);
+  sh_mem_count = ((CANARY_SIZE + 7) & (size_t)~7) >> 3;
+  
+  for (i = 0; i < sh_mem_count; i++) {
+    ctx->sh_memory[sh_mem_offset+i] = SH_MEM_BAD;
+  }
+
+  for (i = 0; i < CANARY_SIZE; i++) {
     *(tmp++) = CANARY_VALUE;
   }
 
   tmp = mem + symbol + CANARY_SIZE + aligned;
+
+  sh_mem_offset = (size_t)((tmp - ctx->memory->memory) >> 3);
+  sh_mem_count = ((CANARY_SIZE + 7) & (size_t)~7) >> 3;
+  
+  for (i = 0; i < sh_mem_count; i++) {
+    ctx->sh_memory[sh_mem_offset+i] = SH_MEM_BAD;
+  }
 
   for (i = 0; i < CANARY_SIZE; i++) {
     *(tmp++) = CANARY_VALUE;
@@ -271,14 +349,16 @@ void DbgFree(void* ptr) {
   DbgSymbol* debuginfo = NULL;
   char* canary1 = NULL;
   char* canary2 = NULL;
-  int i = 0;
+  size_t i = 0;
+  size_t sh_mem_offset = 0;
+  size_t sh_mem_count = 0;
 
   if (ptr == NULL) {
     return;
   }
 
   if (ctx == NULL) {
-    printf("DbgFree: *** not set context*** \n=== abort ===\n");
+    printf("DbgFree: *** not set context ***\n=== abort ===\n");
     abort();
   }
 
@@ -310,10 +390,22 @@ void DbgFree(void* ptr) {
     abort();
   }
 
+  sh_mem_offset = (size_t)(((char*)ptr - ctx->memory->memory) >> 3);
+  sh_mem_count = (debuginfo->real_size) >> 3;
+
+  for (; i < sh_mem_count; i++) {
+    if (ctx->sh_memory[sh_mem_offset+i] != SH_MEM_VALID) {
+      printf("DbgFree: *** pointer to a canary/debug info/freed block ***\n"
+             "(pointer: %p)\n"
+             "=== aborted (core dumped) ===\n", ptr);
+      abort();
+    }
+  }
+
   canary1 = (char*)((char*)ptr - CANARY_SIZE);
   canary2 = (char*)((char*)ptr + debuginfo->real_size);
 
-  for (; i < CANARY_SIZE; i++) {
+  for (i = 0; i < CANARY_SIZE; i++) {
     if (canary1[i] != CANARY_VALUE || canary2[i] != CANARY_VALUE) {
       printf("DbgFree: *** stack smashing detected ***\n"
              "(pointer: %p)\n"
@@ -324,10 +416,14 @@ void DbgFree(void* ptr) {
   
   debuginfo->freed = 1;
 
-  for (i = 0; i < POSION_SIZE; i++) {
-    ((char*)ptr)[i] = POSION_VALUE;
+  for (i = 0; i < POISON_SIZE; i++) {
+    ((char*)ptr)[i] = POISON_VALUE;
   }
   
+  for (i = 0; i < sh_mem_count; i++) {
+    ctx->sh_memory[sh_mem_offset+i] = SH_MEM_FREED; 
+  }
+
   ctx->total_freed++;
 }
 
@@ -418,7 +514,7 @@ void AllocatorLog(void) {
          "Freed blocks:     %lu\n",
          (unsigned long)ctx->total_allocated,
          (unsigned long)ctx->total_freed);
-  
+
   printf("======================\n");
 }
 
@@ -459,9 +555,9 @@ void AllocatorFullCheck(void) {
       abort();
     }
 
-    for (; i < POSION_SIZE; i++) {
-      if (((char*)(pll->ptr))[i] != POSION_VALUE) {
-        printf("CheckPtr: *** Use-After-Free detected (posion corrupted) ***\n"
+    for (; i < POISON_SIZE; i++) {
+      if (((char*)(pll->ptr))[i] != POISON_VALUE) {
+        printf("CheckPtr: *** Use-After-Free detected (poison corrupted) ***\n"
                "(pointer: %p)\n"
                "=== aborted (core dumped) ===\n", pll->ptr);
         abort();
@@ -476,6 +572,57 @@ void AllocatorFullCheck(void) {
            "=== aborted (core dumped) ===\n");
     abort();
   }
+}
+
+void CheckForUse(void* ptr) {
+  AllocatorCtx* ctx = AllocatorCtxManager(0, NULL);
+  DbgSymbol* debuginfo = NULL;
+  size_t i = 0;
+  size_t sh_mem_offset = 0;
+  size_t sh_mem_count = 0;
+
+  if (ptr == NULL) {
+    return;
+  }
+
+  if (ctx == NULL) {
+    printf("CheckForUse: *** not set context ***\n=== abort ===\n");
+    abort();
+  }
+
+  CheckPtr(ptr);
+
+  debuginfo = (DbgSymbol*)(void*)((char*)ptr - ((sizeof(DbgSymbol) + 7) &
+                                                (size_t)~7) - CANARY_SIZE);
+
+  sh_mem_offset = (size_t)(((char*)ptr - ctx->memory->memory) >> 3);
+  sh_mem_count = (debuginfo->real_size) >> 3;
+
+  for (; i < sh_mem_count; i++) {
+    if (ctx->sh_memory[sh_mem_offset+i] != SH_MEM_VALID) {
+      printf("CheckForUse: *** pointer to a canary/debug info/freed block ***\n"
+             "(pointer: %p)\n"
+             "=== aborted (core dumped) ===\n", ptr);
+      abort();
+    }
+  }
+}
+
+size_t GetShMemOffset(void* ptr) {
+  AllocatorCtx* ctx = AllocatorCtxManager(0, NULL);
+  
+  if (ctx == NULL) {
+    printf("GetShMemOffset: *** not set context ***\n=== abort ===\n");
+    abort();
+  }
+  
+  CheckPtr(ptr);
+
+  return (size_t)(((char*)ptr - ctx->memory->memory) >> 3);
+}
+
+size_t GetShMemCountBytes(size_t bytes) {
+  return ((bytes + 7) & (size_t)~7) >> 3;
 }
 
 #endif /* DBG_ALLOC_SOURCE */

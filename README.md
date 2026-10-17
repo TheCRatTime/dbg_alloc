@@ -4,7 +4,8 @@
 ## Description
 This small library that can trace memory bugs:
 **Memory Leak**, **Heap corruption**, **Double Free**,
-**Stack smashing**, **Use-After-Free**.
+**Stack smashing**, **Use-After-Free**, **Stack Overflow**,
+**Stack Underflow**.
 
 ### Features
 - **C89**/**ANSI C** code standard.
