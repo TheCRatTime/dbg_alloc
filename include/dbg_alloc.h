@@ -22,6 +22,9 @@
 #define CANARY_VALUE 0x43 /* Canary value */
 #define CANARY_SIZE  4    /* Canary size */
 
+#define POSION_VALUE 0xCC /* Posion value */
+#define POSION_SIZE  8    /* Posion sizs */
+
 #define DBG_MAGIC_1 0x01 /* Magic 1 */
 #define DBG_MAGIC_2 0x02 /* Magic 2 */
 #define DBG_MAGIC_3 0x03 /* Magic 3 */
@@ -321,6 +324,10 @@ void DbgFree(void* ptr) {
   
   debuginfo->freed = 1;
 
+  for (i = 0; i < POSION_SIZE; i++) {
+    ((char*)ptr)[i] = POSION_VALUE;
+  }
+  
   ctx->total_freed++;
 }
 
@@ -440,6 +447,8 @@ void AllocatorFullCheck(void) {
   pll = ctx->head_of_pll;
 
   while (pll != NULL && pll->ptr != NULL) {
+    int i = 0;
+    
     CheckPtr(pll->ptr);
 
     if (((DbgSymbol*)(void*)((char*)pll->ptr - CANARY_SIZE -
@@ -448,6 +457,15 @@ void AllocatorFullCheck(void) {
              "(pointer: %p)\n"
              "=== aborted (core dumped) ===\n", pll->ptr);
       abort();
+    }
+
+    for (; i < POSION_SIZE; i++) {
+      if (((char*)(pll->ptr))[i] != POSION_VALUE) {
+        printf("CheckPtr: *** Use-After-Free detected (posion corrupted) ***\n"
+               "(pointer: %p)\n"
+               "=== aborted (core dumped) ===\n", pll->ptr);
+        abort();
+      }
     }
     
     pll = pll->next;
