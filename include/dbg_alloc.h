@@ -281,6 +281,10 @@ void* DbgAlloc(size_t bytes) {
     abort();
   }
 
+  if (total & (size_t)7) {
+    size_t total = (symbol + aligned + canary + 7) & (size_t)~7;
+  }
+
   mem = (char*)ChunkAlloc(ctx->memory, total);
   if (mem == NULL) {
     return NULL;
